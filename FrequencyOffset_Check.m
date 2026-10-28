@@ -97,7 +97,7 @@ for snrIdx = 1:numel(SNRIn)
     nVar = N0^2*double(waveformInfo.Nfft);
 
     % Apply Monte-Carlo simulation for computing BLER with randomness
-    MC = 10;
+    MC = 1000;
     blkerr = zeros(MC,1);
 
     % Log
@@ -295,14 +295,14 @@ for snrIdx = 1:numel(SNRIn)
 
         % ---- 信道估计参数 ----
         cfg.channel.model       = 'flat';       % 信道模型：'flat'（默认）| 'multipath'（需 PDP 先验）
-        cfg.ch.maxWin           = 100;          % RLS 窗口物理上限（slot 数）。
+        cfg.ch.maxWin           = 100;          % RLS 窗口物理上限（slot 数）N_max。
         % 实际受 N_max=0.423/(|deltaFErr|·T_slot) 约束（每 slot 重算）。
         % 当前实现：N_max 截断 H_hist 长度；forgetFactor=1.0 时
         % RLS 用全部历史，未实现"硬约束"语义（暂接受）。
-        cfg.ch.forgetFactor     = 1.0;          % RLS 遗忘因子。1.0 = 无遗忘（无限平均）；
+        cfg.ch.forgetFactor     = 1 - 1/cfg.ch.maxWin;          % RLS 遗忘因子。1.0 = 无遗忘（无限平均）；
         % <1 时等效窗口 N_eff=1/(1-forgetFactor)。
         % 若要实现"N_max 硬约束"，可设 forgetFactor=1-1/N_max。
-        cfg.ch.warmupSlots      = 5;            % 信道 RLS 收敛判断的 slot 数，前 5 slot 标 transient
+        cfg.ch.warmupSlots      = 3;            % 信道 RLS 收敛判断的 slot 数，前 5 slot 标 transient
         cfg.ch.sigmaInit        = 1e4;          % RLS 初始化协方差 P=σ_init²，取大让 RLS 快速收敛
         cfg.ch.dataAided        = true;         % 是否启用数据辅助信道估计（时域增益修正）
         cfg.ch.llrThresh        = 4;            % 数据辅助信道估计的 LLR 可靠性门限，|LLR|>4 才算可靠
@@ -312,9 +312,9 @@ for snrIdx = 1:numel(SNRIn)
         cfg.ch.allowDelay       = true;         % 是否允许 delayedInterp（1 slot 延迟），false 时强制 hold
 
         % ---- 噪声估计参数 ----
-        cfg.noise.gammaDMRS            = 0.3;        % DMRS 快路径 IIR 步长（样本少，取大）
+        cfg.noise.gammaDMRS            = 0.15;        % DMRS 快路径 IIR 步长（样本少，取大）
         cfg.noise.gammaData            = 0.15;       % 数据慢路径 IIR 步长（样本多，取小防偏差传播）
-        cfg.noise.warmupSlots          = 5;          % 噪声数据路径 converged 判断的 slot 数
+        cfg.noise.warmupSlots          = 3;          % 噪声数据路径 converged 判断的 slot 数
         cfg.noise.llrThresh            = 4;          % 数据慢路径的 LLR 可靠性门限
         cfg.noise.minAuxRE             = 8;          % 数据慢路径的最小可靠 RE 数
         cfg.noise.inVarFloor           = 1e-6;       % inVar 下限，防负值和零
@@ -659,7 +659,9 @@ Qm      = cfg.Qm;
 nsState = iir_update(nsState, 'dmrs', inVar_dmrs_inst, cfg);
 
 % ---- 均衡（用上一 slot 的 inVar，1 slot 延迟） ----
-lambda   = chInfo.NMSE_theory * mean(abs(H_grid(:)).^2);
+%lambda   = chInfo.NMSE_theory * mean(abs(H_grid(:)).^2);
+%lambda = 0;
+lambda = chInfo.NMSE_theory / max(chState.slotCount, 1) * mean(abs(H_grid(:)).^2);
 inVarEst = nsState.inVar;
 inVarEq  = inVarEst + lambda;
 [puschRx, puschHest] = nrExtractResources(puschIndicesSlot, rxGrid, H_grid);
@@ -669,11 +671,11 @@ end
 [puschEq, csi] = nrEqualizeMMSE(puschRx, puschHest, inVarEq);
 
 % ---- 解调（含 DFT 解预编码） ----
-%inVarDemod = inVarEq;
-inVarDemod = inVarEst;
+inVarDemod = inVarEq;
+%inVarDemod = inVarEst;
 [slotLLRs, rxSymbols] = mynrPUSCHDecode(carrier, PUSCH, puschEq, inVarDemod);
 csi_sym = mynrPUSCHSymbolCSI(carrier, PUSCH, csi);
-%slotLLRs = slotLLRs .* repelem(csi_sym, Qm);
+slotLLRs = slotLLRs .* repelem(csi_sym, Qm);
 
 % ---- 噪声慢路径（时域残差，converged 且 enableDataPath） ----
 if nsState.converged && chState.converged && cfg.noise.enableDataPath
