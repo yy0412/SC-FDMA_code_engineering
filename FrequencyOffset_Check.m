@@ -19,11 +19,11 @@ Carrier.NCellID = 0;  % Cell identity
 
 % Time/frequency-offset configuration for the selectable joint LS methods.
 % 2.5e3 Hz is 2.5 kHz, not 2500 kHz. The occupied bandwidth is 480 kHz.
-ApplyTimeFrequencyOffsets = true;
-EnableTimeFrequencyCompensation = true;
+ApplyTimeFrequencyOffsets = false;
+EnableTimeFrequencyCompensation = false;
 JointEstimatorDomain = 'time'; % 'timeLS' or 'PhaseDiff';
-ActualTimingOffsetSamples = 2;
-ActualFrequencyOffsetHz = 2.5e3;
+ActualTimingOffsetSamples = 0;
+ActualFrequencyOffsetHz = 0;%2.5e3
 DMRSPowerPerRE = 2; % Two comb-2 DMRS REs preserve the four-RE OFDM-symbol energy
 %KnownAk = ones(Carrier.NCustomSubcarriers,1); % Unity-channel CRB reference
 
@@ -367,8 +367,8 @@ for snrIdx = 1:numel(SNRIn)
         % ========== 流式主循环 ==========
         for nslot = 0:NSlot-1
             slotIdx = nslot + 1;
-            rxSlot  = rxGridSlots{slotIdx};
-            puschIdx_slot = puschIndicesSlots{slotIdx};
+            rxGrid  = rxGridSlots{slotIdx};
+            puschIndicesSlot = puschIndicesSlots{slotIdx};
 
             % ---- 解析 DMRS 索引与参考符号 ----
             [dmrsSub, dmrsSymNum] = ind2sub([cfg.Nsc cfg.Nsym], dmrsIndicesSlots{slotIdx});
@@ -377,7 +377,7 @@ for snrIdx = 1:numel(SNRIn)
             dmrsSym = dmrsSymbolsSlots{slotIdx}(isDMRS3);
 
             % ---- 压入 dmrsBuf（三观测环形） ----
-            H_ls_n = rxSlot(dmrsIdx) ./ dmrsSym;
+            H_ls_n = rxGrid(dmrsIdx) ./ dmrsSym;
             chState.dmrsBuf{end+1} = H_ls_n;
             if numel(chState.dmrsBuf) > 3, chState.dmrsBuf(1) = []; end
             chState.dmrsBufCount = min(chState.dmrsBufCount + 1, 3);
@@ -388,9 +388,9 @@ for snrIdx = 1:numel(SNRIn)
             if nslot == 0
                 % ========== 首 slot：强制 hold 输出 ==========
                 [H_grid, chState, chInfo] = channel_estimate_stream_hold( ...
-                    rxSlot, dmrsIdx, dmrsSym, nsState.inVar, chState, cfg);
+                    rxGrid, dmrsIdx, dmrsSym, nsState.inVar, chState, cfg);
                 [slotLLRs, chState, nsState] = process_one_slot( ...
-                    rxSlot, dmrsIdx, dmrsSym, puschIdx_slot, H_grid, ...
+                    rxGrid, dmrsIdx, dmrsSym, puschIndicesSlot, H_grid, ...
                     chState, nsState, chInfo, cfg);
                 ulschLLRs(0*GPerSlot + (1:GPerSlot)) = slotLLRs;
 
@@ -416,18 +416,18 @@ for snrIdx = 1:numel(SNRIn)
             else
                 % ========== hold 模式 ==========
                 [H_grid, chState, chInfo] = channel_estimate_stream_hold( ...
-                    rxSlot, dmrsIdx, dmrsSym, nsState.inVar, chState, cfg);
+                    rxGrid, dmrsIdx, dmrsSym, nsState.inVar, chState, cfg);
                 [slotLLRs, chState, nsState] = process_one_slot( ...
-                    rxSlot, dmrsIdx, dmrsSym, puschIdx_slot, H_grid, ...
+                    rxGrid, dmrsIdx, dmrsSym, puschIndicesSlot, H_grid, ...
                     chState, nsState, chInfo, cfg);
                 ulschLLRs(nslot*GPerSlot + (1:GPerSlot)) = slotLLRs;
             end
 
             % ---- 保存 buffer（供下一 slot delayedInterp / TB 末尾兜底用） ----
-            buf.rxSlotPrev    = rxSlot;      buf.dmrsIdxPrev  = dmrsIdx;
-            buf.dmrsSymPrev   = dmrsSym;     buf.puschIdxPrev = puschIdx_slot;
-            buf.rxSlotCurr    = rxSlot;      buf.dmrsIdxCurr  = dmrsIdx;
-            buf.dmrsSymCurr   = dmrsSym;     buf.puschIdxCurr = puschIdx_slot;
+            buf.rxSlotPrev    = rxGrid;      buf.dmrsIdxPrev  = dmrsIdx;
+            buf.dmrsSymPrev   = dmrsSym;     buf.puschIdxPrev = puschIndicesSlot;
+            buf.rxSlotCurr    = rxGrid;      buf.dmrsIdxCurr  = dmrsIdx;
+            buf.dmrsSymCurr   = dmrsSym;     buf.puschIdxCurr = puschIndicesSlot;
         end
 
         % ========== TB 末尾兜底：delayedInterp 模式下 last slot 用单 slot LS 输出 ==========
@@ -436,8 +436,8 @@ for snrIdx = 1:numel(SNRIn)
             H_scalar  = mean(H_ls_last);                     % 标量
             H_grid_last = complex(zeros(cfg.Nsc, cfg.Nsym));
             H_grid_last(:,3)          = H_scalar;            % 4×1 ← 标量，自动扩展
-            H_grid_last(:,1:2)        = H_scalar;            % 4×2 ← 标量，自动扩展  ★ 修复
-            H_grid_last(:,4:cfg.Nsym) = H_scalar;            % 4×11 ← 标量，自动扩展 ★ 修复
+            H_grid_last(:,1:2)        = H_scalar;            % 4×2 ← 标量，自动扩展
+            H_grid_last(:,4:cfg.Nsym) = H_scalar;            % 4×11 ← 标量，自动扩展
             chInfo_last = struct('NMSE_theory', nsState.inVar / (numel(H_ls_last)*cfg.P_x_dmrs + eps), ...
                 'coldStart', false, 'converged', chState.converged, ...
                 'strategyUsed','hold-bootstrap', 'delaySlots', 0, ...
@@ -532,14 +532,14 @@ end
 
 %% ==================== hold 路径信道估计 ====================
 function [H_grid, state, info] = channel_estimate_stream_hold( ...
-    rxSlot, dmrsIdx, dmrsSym, inVarPrev, state, cfg)
+    rxGrid, dmrsIdx, dmrsSym, inVarPrev, state, cfg)
 if state.slotCount == 0
     state.nmseTheory = 1.0;
     state.strategy   = 'hold';
     state.P          = cfg.ch.sigmaInit^2;
     state.H_avg      = complex(zeros(cfg.Nsc,1));
 end
-H_ls = rxSlot(dmrsIdx) ./ dmrsSym;
+H_ls = rxGrid(dmrsIdx) ./ dmrsSym;
 [H_slot_scalar, freqInfo] = channel_freq_process_flat( ...
     H_ls, inVarPrev, cfg.P_x_dmrs, cfg);
 [state, H_smooth] = rls_update(H_slot_scalar, state, cfg);
@@ -647,7 +647,7 @@ end
 
 %% ==================== 单 slot 完整流程封装 ====================
 function [slotLLRs, chState, nsState] = process_one_slot( ...
-    rxSlot, dmrsIdx, dmrsSym, puschIdx, H_grid, chState, nsState, chInfo, cfg)
+    rxGrid, dmrsIdx, dmrsSym, puschIndicesSlot, H_grid, chState, nsState, chInfo, cfg)
 
 carrier = cfg.ctx.carrier;
 PUSCH   = cfg.ctx.PUSCH;
@@ -655,27 +655,31 @@ Qm      = cfg.Qm;
 
 % ---- DMRS 噪声快路径 ----
 [inVar_dmrs_inst, ~] = dmrs_reconstruction( ...
-    rxSlot(dmrsIdx), dmrsSym, H_grid(dmrsIdx), chInfo.NMSE_theory, cfg);
+    rxGrid(dmrsIdx), dmrsSym, H_grid(dmrsIdx), chInfo.NMSE_theory, cfg);
 nsState = iir_update(nsState, 'dmrs', inVar_dmrs_inst, cfg);
 
 % ---- 均衡（用上一 slot 的 inVar，1 slot 延迟） ----
-inVar_use = nsState.inVar;
-[eqSym, csi, eqInfo] = equalize_stream( ...
-    rxSlot, H_grid, inVar_use, chInfo.NMSE_theory, cfg);
+lambda   = chInfo.NMSE_theory * mean(abs(H_grid(:)).^2);
+inVarEst = nsState.inVar;
+inVarEq  = inVarEst + lambda;
+[puschRx, puschHest] = nrExtractResources(puschIndicesSlot, rxGrid, H_grid);
+if ndims(puschHest) == 2
+    puschHest = reshape(puschHest, size(puschHest,1), 1, 1);
+end
+[puschEq, csi] = nrEqualizeMMSE(puschRx, puschHest, inVarEq);
 
 % ---- 解调（含 DFT 解预编码） ----
-%noise_demod = inVar_use + eqInfo.lambda;
-noise_demod = inVar_use;
-[slotLLRs, rxSymbols] = mynrPUSCHDecode( ...
-    carrier, PUSCH, eqSym(puschIdx), noise_demod);
-csi_sym = mynrPUSCHSymbolCSI(carrier, PUSCH, csi(puschIdx));
+%inVarDemod = inVarEq;
+inVarDemod = inVarEst;
+[slotLLRs, rxSymbols] = mynrPUSCHDecode(carrier, PUSCH, puschEq, inVarDemod);
+csi_sym = mynrPUSCHSymbolCSI(carrier, PUSCH, csi);
 %slotLLRs = slotLLRs .* repelem(csi_sym, Qm);
 
 % ---- 噪声慢路径（时域残差，converged 且 enableDataPath） ----
 if nsState.converged && chState.converged && cfg.noise.enableDataPath
-    H_data_pow = abs(H_grid(puschIdx)).^2;
+    H_data_pow = abs(H_grid(puschIndicesSlot)).^2;
     [inVar_data_inst, ~] = data_reconstruction_time_domain( ...
-        rxSymbols, slotLLRs, csi_sym, H_data_pow, eqInfo.lambda, cfg);
+        rxSymbols, slotLLRs, csi_sym, H_data_pow, lambda, cfg);
     nsState = iir_update(nsState, 'data', inVar_data_inst, cfg);
     nsState.dataReconUsed = ~isnan(inVar_data_inst);
 end
@@ -905,34 +909,27 @@ function state = iir_update(state, path, inVar_inst, cfg)
 % IIR 更新噪声状态
 % path='dmrs'：DMRS 快路径，首 slot 直接赋值（用先验），之后 IIR 平滑
 % path='data'：数据慢路径，首 slot 直接赋值，之后 IIR 平滑，并递增 count 判断 converged
+if isnan(inVar_inst), return; end
 
-    if isnan(inVar_inst), return; end
-
-    switch path
-        case 'dmrs'
-            g = cfg.noise.gammaDMRS;
-            if ~state.inVarDMRSInit
-                % 首 slot：用本次观测直接覆盖先验（不 IIR，让估计快速起步）
-                state.inVarDMRS     = inVar_inst;
-                state.inVarDMRSInit = true;
-            else
-                % 之后：IIR 平滑
-                state.inVarDMRS = (1-g)*state.inVarDMRS + g*inVar_inst;
-            end
-            % 注意：dmrs 路径不递增 state.count，避免干扰 data 路径的 converged 判断
-
-        case 'data'
-            g = cfg.noise.gammaData;
-            if state.count == 0
-                % data 路径首 slot：直接赋值
-                state.inVarData = inVar_inst;
-            else
-                % 之后：IIR 平滑
-                state.inVarData = (1-g)*state.inVarData + g*inVar_inst;
-            end
-            state.count = state.count + 1;
-            state.converged = state.count >= cfg.noise.warmupSlots;
-    end
+switch path
+    case 'dmrs'
+        g = cfg.noise.gammaDMRS;
+        if ~state.inVarDMRSInit
+            state.inVarDMRS     = inVar_inst;
+            state.inVarDMRSInit = true;
+        else
+            state.inVarDMRS = (1-g)*state.inVarDMRS + g*inVar_inst;
+        end
+    case 'data'
+        g = cfg.noise.gammaData;
+        if state.count == 0
+            state.inVarData = inVar_inst;
+        else
+            state.inVarData = (1-g)*state.inVarData + g*inVar_inst;
+        end
+        state.count = state.count + 1;
+        state.converged = state.count >= cfg.noise.warmupSlots;
+end
 end
 
 function [inVar, info] = merge_dmrs_data(state, cfg)
