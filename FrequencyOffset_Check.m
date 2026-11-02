@@ -97,7 +97,7 @@ for snrIdx = 1:numel(SNRIn)
     nVar = N0^2*double(waveformInfo.Nfft);
 
     % Apply Monte-Carlo simulation for computing BLER with randomness
-    MC = 1000;
+    MC = 100;
     blkerr = zeros(MC,1);
 
     % Log
@@ -351,9 +351,31 @@ for snrIdx = 1:numel(SNRIn)
             deltaFErr_sim = ActualFrequencyOffsetHz;
         end
 
-        % ---- 状态初始化 ----
+        % ---- TB 间继承状态（每个 SNR 点首次 mc 初始化，跨 mc 保持） ----
+        if mc == 1
+            chStateAcrossTB = init_channel_state(cfg);
+            nsStateAcrossTB = init_noise_state(cfg);
+            hasValidInheritance = false;    % 是否已有 CRC 通过的 H_avg / inVar 可继承
+        end
+
+        % ---- TB 内状态初始化 ----
         chState = init_channel_state(cfg);
         nsState = init_noise_state(cfg);
+        if hasValidInheritance
+            % 上一 CRC 通过的 TB 有可靠 H_avg / inVar，继承以消除 transient
+            chState.H_avg         = chStateAcrossTB.H_avg;
+            chState.converged     = true;
+            chState.slotCount     = cfg.ch.warmupSlots;      % 让 converged 判据和 nmse 收缩成立
+            nsState.inVarDMRS     = nsStateAcrossTB.inVarDMRS;
+            nsState.inVarData     = nsStateAcrossTB.inVarData;
+            nsState.inVar         = nsStateAcrossTB.inVar;
+            nsState.nVar          = nsStateAcrossTB.nVar;
+            nsState.iVar          = nsStateAcrossTB.iVar;
+            nsState.inVarDMRSInit = true;                    % 直接走 IIR 分支
+            nsState.count         = cfg.noise.warmupSlots;   % data 路径直接 converged
+            nsState.converged     = true;
+        end
+        chState.P             = cfg.ch.sigmaInit^2;          % P 总是重置，让 RLS 快速收敛到继承的 H_avg
         chState.deltaFErr     = deltaFErr_sim;
         chState.deltaFErrConf = 1.0;
         chState.fd            = 0;          % 本轮不开 Jakes
@@ -451,6 +473,22 @@ for snrIdx = 1:numel(SNRIn)
         % ========== 解码 ==========
         decodeULSCH.TransportBlockLength = trBlkSize;
         [a,blkerr(mc)] = decodeULSCH(ulschLLRs,PUSCH.Modulation,PUSCH.NumLayers,rvSeq);
+
+        % ========== TB 结束：CRC 通过才更新跨 TB 继承状态 ==========
+        % data-aided 在 TB 内已用于后续 slot（H_avg 累积），但只有当本 TB CRC 通过时，
+        % 才认为这个被 data-aided 修正过的 H_avg 可信，继承给下一 TB；CRC 失败则保留上次
+        % 通过 CRC 时的 H_avg / inVar，避免被错误 LLR 污染的值扩散到下一 TB。
+        if blkerr(mc) == 0
+            chStateAcrossTB.H_avg     = chState.H_avg;
+            nsStateAcrossTB.inVarDMRS = nsState.inVarDMRS;
+            nsStateAcrossTB.inVarData = nsState.inVarData;
+            nsStateAcrossTB.inVar     = nsState.inVar;
+            nsStateAcrossTB.nVar      = nsState.nVar;
+            nsStateAcrossTB.iVar      = nsState.iVar;
+            hasValidInheritance       = true;
+        end
+        % CRC 失败：不更新 chStateAcrossTB / nsStateAcrossTB，hasValidInheritance 保持不变，
+        % 下一 TB 若仍有可继承值（hasValidInheritance=true），继续使用上次通过的可靠值。
     end
 
     BLER(2,snrIdx) = sum(blkerr)/MC;
@@ -691,6 +729,8 @@ nsState.inVar = max(nsState.inVar, cfg.noise.inVarFloor);
     nsState.inVar, nsState, cfg);
 
 % ---- 数据辅助信道估计（时域增益修正，可选） ----
+% 说明：本函数只更新 H_avg，供下一 slot 使用（后续 slot），不在当前 slot 做均衡器重新迭代。
+%       跨 TB 传播受 CRC 门槛约束（main 循环里 blkerr==0 时才继承给下一 TB）。
 if chState.converged && cfg.ch.dataAided
     [chState, ~] = data_aided_update_time( ...
         rxSymbols, slotLLRs, csi_sym, chState, cfg);
